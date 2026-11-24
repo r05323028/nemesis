@@ -1,14 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{CommandFactory, Parser, Subcommand};
 use nemesis_agent::{spawn_worker_process, PiRuntime, ReviewRequest};
 use nemesis_core::config::{discover_project_root, NemesisConfig, ProjectPaths};
+use nemesis_core::evidence::validate_evidence;
 use nemesis_core::model::{
-    ExecutionPhase, LifecycleStatus, ReviewRun, ReviewerEvent, ReviewerEventType,
-    MODEL_SCHEMA_VERSION,
+    ExecutionPhase, Finding, LifecycleStatus, ReviewResult, ReviewRun, ReviewerEvent,
+    ReviewerEventType, RunKind, VerificationRecord, VerificationResult, MODEL_SCHEMA_VERSION,
 };
 use nemesis_core::store::RunStore;
 use nemesis_integrations::{
@@ -82,6 +84,11 @@ enum Command {
         #[command(subcommand)]
         command: ReviewCommand,
     },
+    /// List, inspect, and independently verify reviewer findings.
+    Finding {
+        #[command(subcommand)]
+        command: FindingCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -129,12 +136,46 @@ enum ReviewCommand {
     Status { run_id: Option<Uuid> },
     /// Request cancellation of a non-terminal run.
     Cancel { run_id: Uuid },
+    /// Show recent persisted JSONL execution events.
+    Events {
+        run_id: Uuid,
+        #[arg(long, default_value_t = 50)]
+        tail: usize,
+    },
+    /// Wait for a run to reach a terminal state with a bounded timeout.
+    Wait {
+        run_id: Uuid,
+        #[arg(long, default_value_t = 900)]
+        timeout_seconds: u64,
+    },
+    /// Retrieve the persisted structured result for a run.
+    Result { run_id: Uuid },
     /// Internal worker entry point used by the process-backed runtime.
     #[command(hide = true)]
     Worker {
         run_id: Uuid,
         #[arg(long)]
         root: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FindingCommand {
+    /// List findings from completed reviewer results.
+    List,
+    /// Show one finding scoped to its originating review run.
+    Show {
+        review_run_id: Uuid,
+        finding_id: String,
+    },
+    /// Launch an independent verifier for one finding.
+    Verify {
+        review_run_id: Uuid,
+        finding_id: String,
+        #[arg(long, default_value = "pi-verifier")]
+        verifier: String,
+        #[arg(long, default_value_t = 900)]
+        timeout_seconds: u64,
     },
 }
 
@@ -175,6 +216,19 @@ struct ReviewStatus {
     result: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize)]
+struct FindingView {
+    review_run_id: Uuid,
+    finding: Finding,
+    verifications: Vec<VerificationRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WaitReport {
+    run: ReviewRun,
+    completed: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     init_logging(cli.json);
@@ -209,6 +263,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Some(Command::Review { command }) => handle_review(&root, command, cli.json)?,
+        Some(Command::Finding { command }) => handle_finding(&root, command, cli.json)?,
     }
     Ok(())
 }
@@ -284,9 +339,11 @@ fn emit_version(json_output: bool) {
             "domain models",
             "integration detection",
             "Pi RPC reviewer runtime",
+            "independent finding verification",
+            "evidence integrity validation",
+            "review event and result observability",
         ],
         planned: &[
-            "independent finding verifier",
             "deterministic gate engine",
             "Spec Kit adapter",
             "OpenCode adapter",
@@ -515,6 +572,292 @@ fn handle_sdd_integration(
     Ok(())
 }
 
+fn handle_finding(root: &Path, command: FindingCommand, json_output: bool) -> Result<()> {
+    match command {
+        FindingCommand::List => {
+            let views = finding_views(root)?;
+            if json_output {
+                print_json(&views)?;
+            } else if views.is_empty() {
+                println!("no persisted findings");
+            } else {
+                for view in views {
+                    println!(
+                        "{}:{} [{}] {}",
+                        view.review_run_id,
+                        view.finding.id,
+                        lifecycle_verification_label(&view.verifications),
+                        view.finding.claim
+                    );
+                }
+            }
+        }
+        FindingCommand::Show {
+            review_run_id,
+            finding_id,
+        } => {
+            let view = finding_view(root, review_run_id, &finding_id)?;
+            if json_output {
+                print_json(&view)?;
+            } else {
+                println!("review run: {}", view.review_run_id);
+                println!("finding: {}", view.finding.id);
+                println!("claim: {}", view.finding.claim);
+                println!("category: {}", view.finding.category);
+                println!("verifications: {}", view.verifications.len());
+                for verification in view.verifications {
+                    println!(
+                        "  {}: {:?}",
+                        verification.verification_run_id, verification.verdict
+                    );
+                }
+            }
+        }
+        FindingCommand::Verify {
+            review_run_id,
+            finding_id,
+            verifier,
+            timeout_seconds,
+        } => queue_verification(
+            root,
+            review_run_id,
+            &finding_id,
+            &verifier,
+            timeout_seconds,
+            json_output,
+        )?,
+    }
+    Ok(())
+}
+
+fn finding_views(root: &Path) -> Result<Vec<FindingView>> {
+    let paths = ProjectPaths::new(root);
+    let store = RunStore::new(paths.clone());
+    let mut views = Vec::new();
+    for run in list_runs(&paths)? {
+        if run.kind != RunKind::Review || run.final_result_ref.is_none() {
+            continue;
+        }
+        let Ok(result) = store.load_result::<ReviewResult>(run.run_id) else {
+            continue;
+        };
+        for finding in result.findings {
+            views.push(FindingView {
+                review_run_id: run.run_id,
+                verifications: verification_records(root, run.run_id, &finding.id)?,
+                finding,
+            });
+        }
+    }
+    Ok(views)
+}
+
+fn finding_view(root: &Path, review_run_id: Uuid, finding_id: &str) -> Result<FindingView> {
+    finding_views(root)?
+        .into_iter()
+        .find(|view| view.review_run_id == review_run_id && view.finding.id == finding_id)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "finding {finding_id} was not found in review run {review_run_id}"
+            ))
+        })
+}
+
+fn revalidate_verification(root: &Path, mut result: VerificationResult) -> VerificationResult {
+    result.record.stale_evidence_refs.clear();
+    for evidence in &mut result.evidence {
+        let _ = validate_evidence(root, evidence, "verification-consumer");
+        if evidence.validation.state != nemesis_core::model::ValidationState::Valid {
+            result.record.stale_evidence_refs.push(evidence.id);
+        }
+    }
+    if !result.record.stale_evidence_refs.is_empty()
+        && matches!(
+            result.record.verdict,
+            nemesis_core::model::VerificationState::Confirmed
+                | nemesis_core::model::VerificationState::Rejected
+        )
+    {
+        result.record.verdict = nemesis_core::model::VerificationState::Inconclusive;
+        let message =
+            "Verification evidence is stale or invalid and must be revalidated before relying on the verdict."
+                .to_owned();
+        if !result.record.uncertainty.contains(&message) {
+            result.record.uncertainty.push(message);
+        }
+    }
+    result
+}
+
+fn verification_records(
+    root: &Path,
+    source_review_run_id: Uuid,
+    finding_id: &str,
+) -> Result<Vec<VerificationRecord>> {
+    let paths = ProjectPaths::new(root);
+    let store = RunStore::new(paths.clone());
+    let mut records = Vec::new();
+    for run in list_runs(&paths)? {
+        if run.kind != RunKind::Verification || run.parent_run_id != Some(source_review_run_id) {
+            continue;
+        }
+        let Ok(result) = store.load_result::<VerificationResult>(run.run_id) else {
+            continue;
+        };
+        if !result.valid {
+            continue;
+        }
+        let result = revalidate_verification(root, result);
+        if result.record.finding_id == finding_id {
+            records.push(result.record);
+        }
+    }
+    records.sort_by_key(|record| record.verified_at);
+    Ok(records)
+}
+
+fn lifecycle_verification_label(records: &[VerificationRecord]) -> &'static str {
+    records
+        .last()
+        .map(|record| match record.verdict {
+            nemesis_core::model::VerificationState::Confirmed => "confirmed",
+            nemesis_core::model::VerificationState::Rejected => "rejected",
+            nemesis_core::model::VerificationState::Inconclusive => "inconclusive",
+            nemesis_core::model::VerificationState::Unverified => "unverified",
+        })
+        .unwrap_or("unverified")
+}
+
+fn queue_verification(
+    root: &Path,
+    source_review_run_id: Uuid,
+    finding_id: &str,
+    verifier_identity: &str,
+    timeout_seconds: u64,
+    json_output: bool,
+) -> Result<()> {
+    if timeout_seconds == 0 {
+        return Err(CliError::Input(
+            "--timeout-seconds must be greater than zero".to_owned(),
+        ));
+    }
+    let paths = ProjectPaths::new(root);
+    let config = NemesisConfig::load(&paths)?;
+    let store = RunStore::new(paths.clone());
+    let source_run = store.load_run(source_review_run_id)?;
+    if source_run.kind != RunKind::Review {
+        return Err(CliError::Input(
+            "finding verification requires an originating reviewer run".to_owned(),
+        ));
+    }
+    let result: ReviewResult = store
+        .load_result(source_review_run_id)
+        .map_err(|_| CliError::Input("the reviewer result is unavailable or invalid".to_owned()))?;
+    if !result.valid {
+        return Err(CliError::Input(
+            "the reviewer result is invalid and cannot be verified".to_owned(),
+        ));
+    }
+    let finding = result
+        .findings
+        .iter()
+        .find(|finding| finding.id == finding_id)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "finding {finding_id} was not found in review run {source_review_run_id}"
+            ))
+        })?;
+    let candidate_evidence = result
+        .evidence
+        .iter()
+        .filter(|evidence| finding.evidence_refs.contains(&evidence.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let runtime = PiRuntime;
+    if !runtime.detect().installed {
+        return Err(CliError::Agent(nemesis_agent::AgentError::Unavailable(
+            "Pi is not installed or not on PATH".to_owned(),
+        )));
+    }
+
+    let verification_run_id = Uuid::new_v4();
+    let run = ReviewRun {
+        schema_version: MODEL_SCHEMA_VERSION.to_owned(),
+        kind: RunKind::Verification,
+        run_id: verification_run_id,
+        parent_run_id: Some(source_review_run_id),
+        agent_runtime: "pi".to_owned(),
+        reviewer_profile: verifier_identity.to_owned(),
+        lifecycle_status: LifecycleStatus::Queued,
+        created_at: Utc::now(),
+        started_at: None,
+        completed_at: None,
+        final_result_ref: None,
+        error: None,
+    };
+    store.ensure(verification_run_id)?;
+    store.save_run(&run)?;
+    let mut request = ReviewRequest::for_verification(
+        verification_run_id,
+        root,
+        source_review_run_id,
+        finding,
+        candidate_evidence,
+        verifier_identity,
+        timeout_seconds.min(config.runtime.reviewer_timeout_seconds),
+    );
+    request.termination_grace_seconds = config.runtime.termination_grace_seconds;
+    request.repository_revision = git_revision(root);
+    store.save_request(verification_run_id, &request)?;
+    store.append_event(&ReviewerEvent {
+        schema_version: MODEL_SCHEMA_VERSION.to_owned(),
+        event_id: Uuid::new_v4(),
+        run_id: verification_run_id,
+        sequence: 1,
+        timestamp: Utc::now(),
+        event_type: ReviewerEventType::RunQueued,
+        phase: ExecutionPhase::Queued,
+        payload: json!({
+            "agent_runtime": "pi",
+            "kind": "verification",
+            "source_review_run_id": source_review_run_id,
+            "finding_id": finding_id,
+        }),
+    })?;
+    let executable = std::env::current_exe().map_err(|source| CliError::Io {
+        path: PathBuf::from("current executable"),
+        source,
+    })?;
+    if let Err(error) = spawn_worker_process(&executable, root, verification_run_id) {
+        let mut failed = run;
+        failed.lifecycle_status = LifecycleStatus::Failed;
+        failed.completed_at = Some(Utc::now());
+        failed.error = Some(error.to_string());
+        store.save_run(&failed)?;
+        return Err(error.into());
+    }
+    if json_output {
+        print_json(&run)?;
+    } else {
+        println!("queued verification run {verification_run_id}");
+        println!("status: nemesis review status {verification_run_id}");
+    }
+    Ok(())
+}
+
+fn git_revision(root: &Path) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .args(["-C", root.to_str()?, "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!revision.is_empty()).then_some(revision)
+}
+
 fn handle_review(root: &Path, command: ReviewCommand, json_output: bool) -> Result<()> {
     match command {
         ReviewCommand::Run {
@@ -534,6 +877,12 @@ fn handle_review(root: &Path, command: ReviewCommand, json_output: bool) -> Resu
         ),
         ReviewCommand::Status { run_id } => review_status(root, run_id, json_output),
         ReviewCommand::Cancel { run_id } => cancel_review(root, run_id, json_output),
+        ReviewCommand::Events { run_id, tail } => review_events(root, run_id, tail, json_output),
+        ReviewCommand::Wait {
+            run_id,
+            timeout_seconds,
+        } => review_wait(root, run_id, timeout_seconds, json_output),
+        ReviewCommand::Result { run_id } => review_result(root, run_id, json_output),
         ReviewCommand::Worker { run_id, root } => {
             nemesis_agent::run_worker(&root, run_id)?;
             Ok(())
@@ -575,6 +924,7 @@ fn queue_review(
     let run_id = Uuid::new_v4();
     let run = ReviewRun {
         schema_version: MODEL_SCHEMA_VERSION.to_owned(),
+        kind: RunKind::Review,
         run_id,
         parent_run_id,
         agent_runtime: agent.to_owned(),
@@ -589,13 +939,14 @@ fn queue_review(
     let store = RunStore::new(paths);
     store.ensure(run_id)?;
     store.save_run(&run)?;
-    let request = ReviewRequest::new(
+    let mut request = ReviewRequest::new(
         run_id,
         root,
         augmented_prompt(root, prompt)?,
         reviewer_profile,
         timeout_seconds.min(config.runtime.reviewer_timeout_seconds),
     );
+    request.termination_grace_seconds = config.runtime.termination_grace_seconds;
     store.save_request(run_id, &request)?;
     store.append_event(&ReviewerEvent {
         schema_version: MODEL_SCHEMA_VERSION.to_owned(),
@@ -605,7 +956,7 @@ fn queue_review(
         timestamp: Utc::now(),
         event_type: ReviewerEventType::RunQueued,
         phase: ExecutionPhase::Queued,
-        payload: json!({"agent_runtime": agent, "reviewer_profile": reviewer_profile}),
+        payload: json!({"agent_runtime": agent, "reviewer_profile": reviewer_profile, "kind": "review"}),
     })?;
     let executable = std::env::current_exe().map_err(|source| CliError::Io {
         path: PathBuf::from("current executable"),
@@ -648,6 +999,19 @@ fn augmented_prompt(root: &Path, prompt: &str) -> Result<String> {
     ))
 }
 
+fn refreshed_result_value(root: &Path, run: &ReviewRun) -> Result<serde_json::Value> {
+    let store = RunStore::new(ProjectPaths::new(root));
+    match run.kind {
+        RunKind::Verification => {
+            let result: VerificationResult = store.load_result(run.run_id)?;
+            let value = serde_json::to_value(revalidate_verification(root, result))
+                .map_err(nemesis_core::CoreError::from)?;
+            Ok(value)
+        }
+        RunKind::Review => Ok(store.load_result(run.run_id)?),
+    }
+}
+
 fn review_status(root: &Path, run_id: Option<Uuid>, json_output: bool) -> Result<()> {
     let paths = ProjectPaths::new(root);
     let store = RunStore::new(paths.clone());
@@ -659,11 +1023,9 @@ fn review_status(root: &Path, run_id: Option<Uuid>, json_output: bool) -> Result
     let statuses = runs
         .into_iter()
         .map(|run| {
-            let result = run.final_result_ref.and_then(|_| {
-                store
-                    .read_json::<serde_json::Value>(&store.result_path(run.run_id))
-                    .ok()
-            });
+            let result = run
+                .final_result_ref
+                .and_then(|_| refreshed_result_value(root, &run).ok());
             ReviewStatus { run, result }
         })
         .collect::<Vec<_>>();
@@ -689,6 +1051,93 @@ fn review_status(root: &Path, run_id: Option<Uuid>, json_output: bool) -> Result
         }
     }
     Ok(())
+}
+
+fn review_events(root: &Path, run_id: Uuid, tail: usize, json_output: bool) -> Result<()> {
+    let store = RunStore::new(ProjectPaths::new(root));
+    let events = store.load_events(run_id)?;
+    let start = events.len().saturating_sub(tail);
+    let selected = &events[start..];
+    if json_output {
+        print_json(&selected)?;
+    } else {
+        for event in selected {
+            println!(
+                "{} {} {:?} {:?} {}",
+                event.sequence,
+                event.timestamp,
+                event.event_type,
+                event.phase,
+                serde_json::to_string(&event.payload).unwrap_or_else(|_| "{}".to_owned())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn review_result(root: &Path, run_id: Uuid, json_output: bool) -> Result<()> {
+    let store = RunStore::new(ProjectPaths::new(root));
+    if !store.result_path(run_id).is_file() {
+        return Err(CliError::Input(format!(
+            "no persisted result is available for run {run_id}"
+        )));
+    }
+    let run = store.load_run(run_id)?;
+    let result = refreshed_result_value(root, &run)?;
+    if json_output {
+        print_json(&result)?;
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(nemesis_core::CoreError::from)?
+        );
+    }
+    Ok(())
+}
+
+fn review_wait(root: &Path, run_id: Uuid, timeout_seconds: u64, json_output: bool) -> Result<()> {
+    if timeout_seconds == 0 {
+        return Err(CliError::Input(
+            "--timeout-seconds must be greater than zero".to_owned(),
+        ));
+    }
+    let store = RunStore::new(ProjectPaths::new(root));
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let run = store.load_run(run_id)?;
+        if run.lifecycle_status.is_terminal() {
+            let report = WaitReport {
+                run,
+                completed: true,
+            };
+            if json_output {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} {}",
+                    report.run.run_id,
+                    lifecycle_name(&report.run.lifecycle_status)
+                );
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let report = WaitReport {
+                run,
+                completed: false,
+            };
+            if json_output {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} still running after {} seconds",
+                    report.run.run_id, timeout_seconds
+                );
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn cancel_review(root: &Path, run_id: Uuid, json_output: bool) -> Result<()> {

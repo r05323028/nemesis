@@ -7,7 +7,7 @@ NEMESIS is an independent, evidence-driven verification layer for existing Spec-
 - **Is:** a Rust CLI and set of small contracts for requirements, evidence, review runs, events, findings, and gate results.
 - **Is:** SDD- and agent-agnostic at the core, with adapters at the edges.
 - **Is not:** a replacement SDD framework, graph database, distributed scheduler, dashboard, or community extension bundle.
-- **Is not yet:** a complete verifier or gate engine. Reviewer findings are explicitly persisted as **unverified** until a future verifier validates them.
+- **Is not yet:** a deterministic quality-gate engine or complete traceability engine. Reviewer findings are persisted as **unverified** until the separate verifier produces a verdict supported by validated evidence.
 
 ## Current status
 
@@ -20,7 +20,8 @@ NEMESIS is an independent, evidence-driven verification layer for existing Spec-
 | OpenSpec read-only schema/artifact inspection | Experimental (M1) |
 | Pi project extension and RPC reviewer worker | Experimental (M1) |
 | Spec Kit, OpenCode, and Codex adapters | Researched; not implemented |
-| Independent verifier and deterministic gate engine | Planned |
+| Independent Pi verifier and evidence integrity checks | Experimental (M2) |
+| Deterministic gate engine | Planned |
 
 ## Build and test
 
@@ -52,6 +53,7 @@ The first vertical slice uses only verified official surfaces:
 2. `nemesis agent integration install pi` installs `.pi/extensions/nemesis-review.ts`, an NEMESIS-owned Pi Extension using Pi's official `registerTool()` API.
 3. The Pi tool calls `nemesis review run`, which queues a persisted run and starts a separate `pi --mode rpc --no-session` process with read-only tools.
 4. The worker records Pi JSONL events, lifecycle state, cancellation requests, timeout state, and the raw/structured result under `.nemesis/runs/<run-id>/`.
+5. `nemesis finding verify` starts a fresh read-only Pi session with only the finding, candidate references, project scope, and workspace revision; it persists a separate verification record and validates source evidence hashes, locators, and excerpts.
 
 For a local development run, put the built binary on `PATH` or set `NEMESIS_BIN` for the Pi extension. A configured Pi model is required for a real review; standard tests never call a paid model.
 
@@ -62,7 +64,11 @@ nemesis init
 nemesis sdd integration install openspec   # only when openspec/ already exists
 nemesis agent integration install pi
 nemesis review run --prompt "Review the current OpenSpec change for missing requirements and edge cases."
-nemesis review status
+nemesis review wait <review-run-id>
+nemesis review events <review-run-id>
+nemesis finding list
+nemesis finding verify <review-run-id> F-001
+nemesis finding show <review-run-id> F-001
 ```
 
 Reviewers default to read-only execution (`read` only, no session, no extensions, no MCP, and no project approval). A separate Pi session is not treated as filesystem isolation; stronger sandbox/worktree isolation remains future work.

@@ -73,6 +73,10 @@ impl RunStore {
         self.write_json(&self.result_path(run_id), result)
     }
 
+    pub fn load_result<T: DeserializeOwned>(&self, run_id: Uuid) -> Result<T> {
+        self.read_json(&self.result_path(run_id))
+    }
+
     pub fn append_event(&self, event: &ReviewerEvent) -> Result<()> {
         self.ensure(event.run_id)?;
         let path = self.events_path(event.run_id);
@@ -83,6 +87,19 @@ impl RunStore {
             .map_err(|source| io_error(&path, source))?;
         let line = serde_json::to_string(event)?;
         writeln!(file, "{line}").map_err(|source| io_error(path, source))
+    }
+
+    pub fn load_events(&self, run_id: Uuid) -> Result<Vec<ReviewerEvent>> {
+        let path = self.events_path(run_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).map_err(Into::into))
+            .collect()
     }
 
     pub fn request_cancel(&self, run_id: Uuid) -> Result<()> {

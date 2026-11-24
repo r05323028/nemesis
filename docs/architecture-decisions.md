@@ -138,3 +138,11 @@ A reviewer may produce an unverified finding and evidence. The future verifier m
 3. whether a fix resolves the finding.
 
 Only validated evidence may be passed to a versioned gate policy. Missing evidence maps to `inconclusive`, never silently to `pass`.
+
+## 8. Independent finding verification
+
+The first verification loop reuses the existing persisted run store rather than adding a scheduler or service. A verifier is a `ReviewRun` with `kind: verification`, `parent_run_id` set to the originating reviewer run, and a separate Pi `--no-session` process. Its request contains only the finding, candidate references, candidate evidence, project scope, and optional workspace revision; reviewer transcripts and implementer conclusions are not copied.
+
+Verifier output is structurally validated before the run can be completed. Source evidence is collected into the existing `Evidence` model and checked deterministically for workspace scope, SHA-256 content hash, line locator resolution, exact excerpt match, and later staleness. A reported `confirmed` or `rejected` verdict without valid supporting or contradicting evidence is persisted as `inconclusive`, while the original reported verdict and uncertainty remain inspectable. Each verification result is stored in its own run directory and never overwrites the reviewer result.
+
+Timeout and cancellation use the existing child-process lifecycle with a bounded termination grace period. The JSONL event store is exposed through CLI operations for status, events, bounded wait, result retrieval, and cancellation; finding list/show/verify commands retain parent-agent control over semantic workflow decisions.

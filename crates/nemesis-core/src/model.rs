@@ -126,6 +126,8 @@ pub enum EvidenceType {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollectionMetadata {
     pub collector: String,
+    #[serde(default)]
+    pub method: String,
     pub collected_at: DateTime<Utc>,
     pub command: Option<String>,
 }
@@ -135,6 +137,8 @@ pub struct EvidenceValidation {
     pub state: ValidationState,
     pub validated_at: Option<DateTime<Utc>>,
     pub validator: Option<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +177,8 @@ pub enum VerificationState {
 pub struct ReviewRun {
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
+    #[serde(default = "default_run_kind")]
+    pub kind: RunKind,
     pub run_id: Uuid,
     pub parent_run_id: Option<Uuid>,
     pub agent_runtime: String,
@@ -183,6 +189,17 @@ pub struct ReviewRun {
     pub completed_at: Option<DateTime<Utc>>,
     pub final_result_ref: Option<Uuid>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    Review,
+    Verification,
+}
+
+fn default_run_kind() -> RunKind {
+    RunKind::Review
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +271,45 @@ pub struct ReviewResult {
     pub evidence: Vec<Evidence>,
     pub raw_output: String,
     pub structured: bool,
+    #[serde(default)]
+    pub valid: bool,
+    pub parse_error: Option<String>,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationRecord {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: String,
+    pub verification_id: Uuid,
+    pub verification_run_id: Uuid,
+    pub source_review_run_id: Uuid,
+    pub finding_id: String,
+    pub verifier_identity: String,
+    pub reported_verdict: VerificationState,
+    pub verdict: VerificationState,
+    pub supporting_evidence_refs: Vec<Uuid>,
+    pub contradicting_evidence_refs: Vec<Uuid>,
+    #[serde(default)]
+    pub stale_evidence_refs: Vec<Uuid>,
+    pub observations: Vec<String>,
+    pub interpretations: Vec<String>,
+    pub explanation: String,
+    pub uncertainty: Vec<String>,
+    pub verified_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationResult {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: String,
+    pub result_id: Uuid,
+    pub record: VerificationRecord,
+    pub evidence: Vec<Evidence>,
+    pub raw_output: String,
+    pub structured: bool,
+    #[serde(default)]
+    pub valid: bool,
     pub parse_error: Option<String>,
     pub completed_at: DateTime<Utc>,
 }

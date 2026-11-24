@@ -8,6 +8,10 @@ use crate::error::{io_error, CoreError, Result};
 pub const CONFIG_VERSION: u32 = 1;
 pub const CONFIG_RELATIVE_PATH: &str = ".nemesis/config.toml";
 
+fn default_termination_grace_seconds() -> u64 {
+    2
+}
+
 #[derive(Clone, Debug)]
 pub struct ProjectPaths {
     root: PathBuf,
@@ -63,6 +67,8 @@ pub struct ProjectConfig {
 pub struct RuntimeConfig {
     pub reviewer_timeout_seconds: u64,
     pub max_child_depth: u8,
+    #[serde(default = "default_termination_grace_seconds")]
+    pub termination_grace_seconds: u64,
 }
 
 impl Default for NemesisConfig {
@@ -75,6 +81,7 @@ impl Default for NemesisConfig {
             runtime: RuntimeConfig {
                 reviewer_timeout_seconds: 900,
                 max_child_depth: 1,
+                termination_grace_seconds: default_termination_grace_seconds(),
             },
         }
     }
@@ -109,6 +116,11 @@ impl NemesisConfig {
         if self.runtime.max_child_depth == 0 {
             return Err(CoreError::InvalidConfig(
                 "runtime.max_child_depth must be greater than zero".to_owned(),
+            ));
+        }
+        if self.runtime.termination_grace_seconds == 0 {
+            return Err(CoreError::InvalidConfig(
+                "runtime.termination_grace_seconds must be greater than zero".to_owned(),
             ));
         }
         Ok(())
