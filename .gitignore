@@ -1,0 +1,6 @@
+/target/
+.DS_Store
+
+# Local NEMESIS runtime state. The project configuration remains trackable.
+.nemesis/runs/
+.nemesis/integrations.json
